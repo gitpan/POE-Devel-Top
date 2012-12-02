@@ -8,19 +8,20 @@ use POE qw< API::Peek Session >;
 use Term::ANSIColor qw< :constants >;
 
 
-our $VERSION = "0.001";
+our $VERSION = "0.100";
 
 
 #
 # import()
 # ------
 sub import {
-    my ($class) = @_;
+    my ($class, @args) = @_;
 
     # if caller line is zero, it means the module was loaded from the
     # command line, in which case we automatically spawn the session
-    my (undef, undef, $line) = caller;
-    $class->spawn if $line == 0;
+    my ($package, undef, $line) = caller;
+    $class->spawn(render => "console", @args)
+        if $line == 0 or $package eq __PACKAGE__;
 }
 
 
@@ -31,17 +32,117 @@ sub spawn {
     my ($class, @args) = @_;
 
     croak "Odd number of argument" if @args % 2 == 1;
-    my %param = @args;
 
     POE::Session->create(
+        heap => {
+            interval => 2,
+            @args
+        },
+
         inline_states => {
             _start => sub {
                 $_[KERNEL]->alias_set("[$class]");
-                $_[KERNEL]->delay(poe_devel_top => 2);
+                $_[KERNEL]->delay(poe_devel_top_collect => $_[HEAP]->{interval});
             },
-            poe_devel_top => \&render,
+            poe_devel_top_collect   => \&collect,
+            poe_devel_top_render    => \&render,
+            poe_devel_top_store     => \&store,
         },
     );
+}
+
+
+#
+# collect()
+# -------
+sub collect {
+    my ($kernel, $heap) = @_[ KERNEL, HEAP ];
+    my $poe_api = POE::API::Peek->new;
+    my $now = time;
+
+    # collect general data about the current process
+    my @times = times;
+    my @pwent = getpwuid(int $>);
+    my $egid  = (split / /, $))[0];
+    my @grent = getgrgid(int $egid);
+
+    my %general = (
+        process => {
+            pid     => $$,
+            uid     => $>,
+            gid     => $egid,
+            user    => $pwent[0],
+            group   => $grent[0],
+        },
+        resource => {
+            utime_self  => $times[0],
+            utime_chld  => $times[2],
+            stime_self  => $times[1],
+            stime_chld  => $times[3],
+        },
+        poe => {
+            sessions    => $poe_api->session_count,
+            handles     => $poe_api->handle_count,
+            loop        => $poe_api->which_loop,
+        },
+    );
+
+    # collect information about the sessions
+    my $kernel_id = $kernel->ID;
+    my @sessions;
+
+    for my $session ($poe_api->session_list) {
+        push @sessions, {
+          $session->ID eq $kernel_id ? (
+              id        => 0,
+              aliases   => "[POE::Kernel] id=".$session->ID,
+          ) : (
+              id        => $session->ID,
+              aliases   => join(",", $poe_api->session_alias_list($session)),
+          ),
+          memory_size   => $poe_api->session_memory_size($session),
+          refcount      => $poe_api->get_session_refcount($session),
+          events_to     => $poe_api->event_count_to($session),
+          events_from   => $poe_api->event_count_from($session),
+        };
+    }
+
+    @sessions = sort { $a->{id} <=> $b->{id} } @sessions;
+
+    # collect information about the events
+    my @events;
+
+    for my $event ($poe_api->event_queue_dump) {
+        push @events, {
+            id          => $event->{ID},
+            name        => $event->{event},
+            type        => $event->{type},
+            priority    => $event->{priority} > $now ?
+                $event->{priority} - $now : $event->{priority},
+            source      => $event->{source}->ID,
+            destination => $event->{destination}->ID,
+        }
+    }
+
+    # create the final hash
+    my %stats = (
+        general     => \%general,
+        sessions    => \@sessions,
+        events      => \@events,
+    );
+
+    # call myself
+    $kernel->delay(poe_devel_top_collect => $heap->{interval});
+
+    # call the dumper event
+    $kernel->yield(poe_devel_top_store => \%stats)
+        if $heap->{dump_as} and $heap->{dump_as} ne "none";
+
+    # call the renderer event
+    $kernel->yield(poe_devel_top_render => \%stats)
+        if $heap->{render} eq "console";
+
+    return \%stats
 }
 
 
@@ -49,11 +150,9 @@ sub spawn {
 # render()
 # ------
 sub render {
-    my $kernel = $_[KERNEL];
-    my $poe_api = POE::API::Peek->new;
-    my $now = time;
-
-    $kernel->delay(poe_devel_top => 2);
+    my ($kernel, $stats) = @_[ KERNEL, ARG0 ];
+    my $proc    = $stats->{general}{process};
+    my $rsrc    = $stats->{general}{resource};
 
     local $Term::ANSIColor::AUTORESET = 1;
 
@@ -65,54 +164,32 @@ sub render {
     my $event_row       = "%5d  %-17s %4d %5d %5d  %-40s\n";
     my @event_cols      = qw< ID Type Pri Src Dest Name >;
 
-    my @times = times;
-    my @pwent = getpwuid(int $>);
-    my $egid  = (split / /, $))[0];
-    my @grent = getgrgid(int $egid);
-
-    print "\e[2J";
-    print "Process ID: $$,  UID: $> ($pwent[0]),  GID: $egid ($grent[0])\n",
-          "Resource usage:  user: $times[0] sec (+$times[2] sec),  ",
-                        "system: $times[1] sec (+$times[3] sec)\n",
-          "Sessions: ", $poe_api->session_count, " total,  ",
-          "Handles: ", $poe_api->handle_count, " total,  ",
-          "Loop: ", $poe_api->which_loop, "\n\n";
-
-    my $kernel_id   = $kernel->ID;
-    my $kernel_name = "[POE::Kernel]";
-
-    if ($kernel_id !~ /^\d/) {
-        $kernel_name .= " id=$kernel_id";
-        $kernel_id   = 0;
-    }
+    print "\e[2J\e[f",
+          "Process ID: $proc->{pid},  ",
+          "UID: $proc->{uid} ($proc->{user}),  ",
+          "GID: $proc->{gid} ($proc->{group})\n",
+          "Resource usage:  ",
+            "user: $rsrc->{utime_self} sec (+$rsrc->{utime_chld} sec),  ",
+            "system: $rsrc->{stime_self} sec (+$rsrc->{stime_chld} sec)\n",
+          "Sessions: $stats->{general}{poe}{sessions} total,  ",
+          "Handles: $stats->{general}{poe}{handles} total,  ",
+          "Loop: $stats->{general}{poe}{loop}\n\n";
 
     print BOLD " Sessions", $/;
     printf $session_head, @session_cols;
     printf $session_row,
-        $kernel_id,
-        human_size( $poe_api->kernel_memory_size ),
-        $poe_api->get_session_refcount($kernel), 
-        $poe_api->event_count_to($kernel), 
-        $poe_api->event_count_from($kernel),
-        $kernel_name;
-    printf $session_row,
-        $_->ID,
-        human_size( $poe_api->session_memory_size($_) ),
-        $poe_api->get_session_refcount($_),
-        $poe_api->event_count_to($_),
-        $poe_api->event_count_from($_),
-        join(",", $poe_api->session_alias_list($_))
-        for sort { $a->ID <=> $b->ID } $poe_api->session_list;
+        $_->{id}, human_size( $_->{memory_size} ), $_->{refcount},
+        $_->{events_to}, $_->{events_from}, $_->{aliases}
+        for @{$stats->{sessions}};
 
     print $/;
 
     print BOLD " Events", $/;
     printf $event_head, @event_cols;
-    printf $event_row, $_->{ID}, $_->{type},
-        $_->{priority} > $now ? $_->{priority}-$now : $_->{priority},
-        $_->{source}->ID,
-        $_->{destination}->ID, $_->{event}
-        for $poe_api->event_queue_dump;
+    printf $event_row,
+        $_->{id}, $_->{type}, $_->{priority},
+        $_->{source}, $_->{destination}, $_->{name}
+        for @{$stats->{events}};
 
     print $/;
 }
@@ -137,6 +214,38 @@ sub human_size {
 }
 
 
+#
+# store()
+# -----
+sub store {
+    my ($kernel, $heap, $stats) = @_[ KERNEL, HEAP, ARG0 ];
+
+    if ($heap->{dump_as} eq "yaml") {
+        if (eval "require YAML; 1") {
+            YAML::DumpFile($heap->{dump_to}, $stats);
+            return
+        }
+        else {
+            $heap->{dump_as} = "native";
+            $heap->{dump_to} =~ s/\.ya?ml$/.dmp/;
+            carp "warning: YAML not available. Defaulting to native format."
+        }
+    }
+
+    if ($heap->{dump_as} eq "native") {
+        if (eval "require Storable; 1") {
+            Storable::nstore($stats, $heap->{dump_to});
+            return
+        }
+        else {
+            croak "fatal: Can't load Storable: $@"
+        }
+    }
+}
+
+
+__PACKAGE__
+
 __END__
 
 =head1 NAME
@@ -145,7 +254,7 @@ POE::Devel::Top - Display information about POE sessions and events
 
 =head1 VERSION
 
-Version 0.001
+Version 0.100
 
 =head1 SYNOPSIS
 
@@ -174,6 +283,30 @@ In this early version, it only prints the information on C<STDOUT>.
 =head2 spawn()
 
 Create the internal session that prints the information on screen.
+
+B<Options>
+
+=over
+
+=item *
+
+C<dump_as> - Specify the dumping format: C<"native"> for Storable,
+C<"yaml"> for YAML.
+
+=item *
+
+C<dump_to> - Specify the dump file path.
+
+=item *
+
+C<interval> - Specify the delay in seconds between updates.
+
+=item *
+
+C<render> - Set to C<"none"> to disable any rendering. Set to C<"console">
+to enable a rendering on the console, similar to the C<top(1)> command.
+
+=back
 
 
 =head1 AUTHOR
